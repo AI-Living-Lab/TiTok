@@ -7,27 +7,25 @@ maketable.py — 폴더 경로를 주면 그 하위의 모든 평가 summary 를
 결과 폴더(=pairwise_miou_summary.json 이 있는 폴더)당 1행. n_samples<500 은 제외.
 행은 sample_mIoU 내림차순 정렬.
 
-열(탭 구분, 21개):
-  ID  ckpt  sample_mIoU
-  F1@0.1  F1@0.3  F1@0.5  F1@0.7  F1@0.9        # threshold 별 F1 (각 열)
-  CR  FMR  CountF1
-  SCR
-  R@0.1  R@0.3  R@0.5  R@0.7  R@0.9            # threshold 별 Recall (각 열)
-  gt(mean)  pred(mean)  n_samples  testset
+열(기본, 탭 구분, 12개):
+  ID  ckpt  sample_mIoU  F1@0.1  F1@0.3  F1@0.5  F1@0.7  CountF1  USA  OSA
+  n_samples  testset
 
-  - sample_mIoU : sample_miou_summary.json 의 mIoU_% (샘플단위 All_IoU 평균)
-  - F1@θ / R@θ  : pairwise_miou_summary.json 기준 (best-match 세그먼트 단위)
-  - CR      : CR* = chance 보정 후 멀티(N_gt>=2) 개수일치도. (CR_multi-b)/(1-b), [0,1] 클립.
-              0=찍기 수준, 1=완벽. 높을수록 좋음. (count_metrics.CR_star)
-  - FMR     : 싱글(N_gt==1)을 2개 이상으로 쪼갠 비율. 낮을수록 좋음. (count_metrics.FMR)
-  - CountF1 : 조화평균(CR*, 1-FMR). 두 항 중 하나라도 0이면 0 → 반복포착+단일비분할
-              둘 다 잘해야 높음. (count_metrics.CountF1)
-      ※ CR/FMR/CountF1 은 count_metrics 가 있는(=최신 eval_miou.py 로 채점한) summary 만 값,
-         구버전 summary 는 '-'. 채우려면 eval_miou.py 재실행.
-  - SCR (Segment Count Ratio) : min(N_pred, N_gt) / max(N_pred, N_gt).
-      N_* = 샘플당 평균 세그먼트 수(pred/gt_segments.mean_per_sample). 1.0 에 가까울수록
-      예측 세그먼트 개수 규모가 GT 와 일치. (개수 비율일 뿐, 위치 정확도와 무관)
-  - gt/pred(mean): gt_segments.mean_per_sample, pred_segments.mean_per_sample (각 열)
+  - sample_mIoU : sample_miou_summary.json 의 mIoU_% (샘플단위 All_IoU 평균).
+                  F1 열은 pairwise 기준이라 지표 계열이 섞인다. 열 이름에 'sample' 을
+                  남겨 둔 이유가 이것이니 그냥 'mIoU' 로 줄여 읽지 말 것.
+  - F1@θ    : pairwise_miou_summary.json 기준 (best-match 세그먼트 단위)
+  - CountF1 : 조화평균(USA, OSA). 둘 중 하나라도 0 이면 0 → 반복포착 + 단일비분할을
+              둘 다 잘해야 높음.
+  - USA     : = CR* = chance 보정 후 멀티(N_gt>=2) 개수일치도. (CR_multi-b)/(1-b), [0,1] 클립.
+              0=찍기 수준, 1=완벽. under-segmentation 해소력.
+  - OSA     : = SingleAcc = 싱글(N_gt==1) 을 쪼개지 않은 비율(=1-FMR). 높을수록 좋음.
+      ※ 파싱 실패(pred 0개) 가 많은 모델은 N_pred<=1 로 잡혀 OSA 가 부풀 수 있다.
+        비교 전 summary 의 parse_fail 을 같이 확인할 것.
+      ※ 구버전 summary(count_metrics 블록 없음) 는 최상위 CR_star/FMR 에서 읽고,
+        SingleAcc 가 없으면 1-FMR 로 환산한다. 셋 다 없으면 '-'.
+
+  --full : 기존 21열(F1@0.9, CR/FMR, SCR, R@θ, gt/pred(mean) 포함) 로 출력.
 
 사용:  python3 maketable.py /home/team404/workspace/outputs/gdpo
 """
@@ -37,12 +35,17 @@ import os
 import re
 
 THS = ["0.1", "0.3", "0.5", "0.7", "0.9"]
+MAIN_THS = ["0.1", "0.3", "0.5", "0.7"]          # 기본 표에 싣는 threshold
 
 HEADER = (["ID", "ckpt", "sample_mIoU"]
-          + [f"F1@{t}" for t in THS]
-          + ["CR", "FMR", "CountF1", "SCR"]
-          + [f"R@{t}" for t in THS]
-          + ["gt(mean)", "pred(mean)", "n_samples", "testset"])
+          + [f"F1@{t}" for t in MAIN_THS]
+          + ["CountF1", "USA", "OSA", "n_samples", "testset"])
+
+HEADER_FULL = (["ID", "ckpt", "sample_mIoU"]
+               + [f"F1@{t}" for t in THS]
+               + ["CountF1", "USA", "OSA", "SCR"]
+               + [f"R@{t}" for t in THS]
+               + ["gt(mean)", "pred(mean)", "n_samples", "testset"])
 
 
 def _num(x):
@@ -75,6 +78,21 @@ def _scr(gmean, pmean):
     if hi <= 0:
         return "-"
     return f"{min(g, p) / hi:.2f}"
+
+
+def _count_metrics(p):
+    """USA/OSA/CountF1 추출. 최신(count_metrics 블록) + 구버전(flat) 스키마 모두 지원.
+
+    USA = CR_star, OSA = SingleAcc. 구버전 summary 에는 SingleAcc 가 없어 1-FMR 로
+    환산한다(정의상 FMR = 1 - SingleAcc).
+    """
+    cm = p.get("count_metrics")
+    if not isinstance(cm, dict):
+        cm = p                                   # 구버전: 최상위에 CR_star/FMR/CountF1
+    osa = cm.get("SingleAcc")
+    if osa is None and _isnum(cm.get("FMR")):
+        osa = 1.0 - float(cm["FMR"])
+    return _num(cm.get("CountF1")), _num(cm.get("CR_star")), _num(osa)
 
 
 def parse_path(dirpath):
@@ -110,7 +128,10 @@ def main():
     ap = argparse.ArgumentParser(description="폴더 하위 평가 summary → table.txt (단일 표, 탭 구분)")
     ap.add_argument("path", help="탐색 루트 (예: outputs/gdpo). 이 안에 table.txt 생성")
     ap.add_argument("--out", default="table.txt", help="출력 파일명 (기본 table.txt)")
+    ap.add_argument("--full", action="store_true",
+                    help="기존 전체 열(F1@0.9, SCR, R@θ, gt/pred(mean) 포함) 로 출력")
     args = ap.parse_args()
+    header = HEADER_FULL if args.full else HEADER
     root = os.path.abspath(args.path)
     if not os.path.isdir(root):
         raise SystemExit(f"[에러] 폴더가 아님: {root}")
@@ -130,27 +151,30 @@ def main():
         pmean = _num(p.get("pred_segments", {}).get("mean_per_sample"))
         scr = _scr(gmean, pmean)
 
-        cm = p.get("count_metrics") or {}
-        cr = _num(cm.get("CR_star"))        # None(서브셋 없음/구버전) → '-'
-        fmr = _num(cm.get("FMR"))
-        countf1 = _num(cm.get("CountF1"))
+        countf1, usa, osa = _count_metrics(p)
+        n = str(p.get("n_samples", "-"))
 
-        rows.append([ID, ckpt, sample]
-                    + _series_cols(p.get("F1"))
-                    + [cr, fmr, countf1, scr]
-                    + _series_cols(p.get("Recall"))
-                    + [gmean, pmean, str(p.get("n_samples", "-")), testset])
+        if args.full:
+            rows.append([ID, ckpt, sample]
+                        + _series_cols(p.get("F1"))
+                        + [countf1, usa, osa, scr]
+                        + _series_cols(p.get("Recall"))
+                        + [gmean, pmean, n, testset])
+        else:
+            rows.append([ID, ckpt, sample]
+                        + _series_cols(p.get("F1"), MAIN_THS)
+                        + [countf1, usa, osa, n, testset])
 
     # sample_mIoU (열 인덱스 2) 내림차순
     rows.sort(key=lambda r: (float(r[2]) if _isnum(r[2]) else -1.0), reverse=True)
 
-    lines = ["\t".join(HEADER)] + ["\t".join(r) for r in rows]
+    lines = ["\t".join(header)] + ["\t".join(r) for r in rows]
     out_path = os.path.join(root, args.out)
     tmp = out_path + ".tmp"
     with open(tmp, "w") as f:
         f.write("\n".join(lines) + "\n")
     os.replace(tmp, out_path)
-    print(f"[SAVED] {out_path}  ({len(rows)} 행, {len(HEADER)} 열)")
+    print(f"[SAVED] {out_path}  ({len(rows)} 행, {len(header)} 열)")
 
 
 if __name__ == "__main__":
