@@ -30,6 +30,7 @@ Team4/
 │   ├── run_rMsep3_*.sh         #   런처
 │   └── demo_app.py             #   Gradio 데모
 ├── eval/                       # Stage 3: 추론 + mIoU 평가
+│   └── analysis/              #   보조 분석·재채점 스크립트 + 파서 검증
 ├── tools/                      # 보조: TTI 회귀검증, debug dump, time-token 추가, 데이터 준비
 ├── docs/                       # 상세 가이드 (GDPO 학습법 / 평가법 / 결과 기록)
 └── paths.example.env           # 경로 템플릿
@@ -87,7 +88,11 @@ python tools/sft/verify_time_tokens.py          # 등록 확인
 |---|---|---|---|
 | `workspace/checkpoints` | `gdrive:checkpoints` | 59 GB  | base(time-token 추가본), SFT/GDPO LoRA 및 머지 체크포인트 |
 | `workspace/data`        | `gdrive:data`        | 407 MB | 학습/평가 JSON (`train/`, `val/`, `test/<TESTSET>/chunk_*.json`) |
-| `workspace/outputs`     | `gdrive:outputs`     | 78 GB  | 추론 결과(`test_results_rank*.json`) + eval summary + `table.txt` |
+| `workspace/outputs`     | `gdrive:outputs`     | 378 MB | 추론 결과(`test_results_rank*.json`) + eval summary + `table.txt` |
+
+> ⚠️ `outputs/**/.merged_model/` (평가 시 LoRA→base 자동 머지본, 총 68 GB) 은 **백업하지 않는다.**
+> base + LoRA 가 `gdrive:checkpoints` 에 있으므로 `eval.sh` 가 다시 만든다. 로컬 `outputs` 는
+> 77 GB 지만 그중 76.6 GB 가 이 파생물이고, 실제 결과물은 1,618 개 / 378 MB 다.
 
 ### 전체 복원
 
@@ -96,8 +101,11 @@ WS=$HOME/workspace     # = DATA_ROOT / BASE_ROOT 가 가리키는 곳
 
 rclone copy gdrive:data        $WS/data        --transfers 8 --checkers 16 --progress
 rclone copy gdrive:checkpoints $WS/checkpoints --transfers 8 --checkers 16 --drive-chunk-size 32M --progress
-rclone copy gdrive:outputs     $WS/outputs     --transfers 8 --checkers 16 --drive-chunk-size 32M --progress
+rclone copy gdrive:outputs     $WS/outputs     --transfers 8 --checkers 16 --progress
 ```
+
+`outputs` 는 결과 JSON 뿐이라 금방 받아진다. 재평가할 때 `.merged_model` 이 자동으로 다시 생기며
+런당 12~18 GB 를 먹으니 디스크 여유를 확인할 것.
 
 > `--transfers` × `--drive-chunk-size` 가 곧 rclone 의 메모리 사용량이다. RAM 이 작은 서버면
 > `--transfers 4 --drive-chunk-size 16M` 으로 낮출 것. (이관 당시 서버: RAM 3 GB / 2 vCPU)
@@ -214,6 +222,35 @@ mIoU 만으로는 세그먼트를 몇 개 잡았는지가 안 보이고, F1 만�
 >
 > ⚠️ 파싱 실패(pred 0개)가 많은 모델은 `N_pred≤1` 로 잡혀 `OSA` 가 부풀 수 있다.
 > 비교 전 summary 의 `parse_fail` 을 반드시 같이 확인할 것.
+
+#### 보조 분석 스크립트 (`eval/analysis/`)
+
+`eval.sh` 가 만든 결과 JSON 을 다시 파고들 때 쓰는 것들. 전부 `Team4/eval` 을 `sys.path` 에
+넣고 `eval_miou.py` / `count_f1.py` 의 채점 함수를 그대로 재사용하므로 본 평가와 수치가 맞물린다.
+
+| 스크립트 | 용도 |
+|---|---|
+| `report_metrics.py` | **보고 표준 지표를 한 번에** — F1@0.1/0.3/0.5/0.7 + mIoU + CountF1 |
+| `recompute_countf1_unav.py` | UnAV-100 USA/OSA/CountF1 재계산. summary 를 믿지 않고 `test_results_rank0.json` 에서 다시 뽑는다 |
+| `countf1_mae_123plus.py` | N_gt = 1/2/3+ 버킷별 count MAE 및 CountF1 |
+| `breakdown_by_ngt.py` | UnAV-100 결과를 N_gt(정답 세그먼트 수)별로 재집계 |
+| `osa_charades.py` | Charades OSA(over-segmentation avoidance) 계산 |
+| `score_charades_all.py` | Charades-STA 전체(3,720) 재채점. ChronusOmni `cal_iou.py` 와 동일 규칙 |
+| `parse_rate.py` | 파싱 성공률. 정의는 `eval_miou.py` 와 동일 |
+| `run_unav_eval_1200.sh` / `run_countf1_1200.sh` / `run_noaudio_eval.sh` / `finish_charades_eval.sh` | 장시간 평가 배치 런처 (선행 작업 pid 대기 → 평가 → 집계) |
+| `parser_verification/` | LLM 으로 파서 출력을 교차검증 (`pv_data`/`pv_llm`/`pv_metrics`/`pv_report`) |
+
+경로는 스크립트 위치에서 유도한다 — `Team4/eval/analysis/` 에 있다는 전제로 `WS`(workspace)
+와 `EV`(Team4/eval) 를 잡는다. 다른 배치로 쓰려면 `WORKSPACE` 환경변수로 덮어쓴다.
+
+```bash
+export WORKSPACE=/path/to/workspace     # 기본값이 안 맞을 때만
+python3 eval/analysis/report_metrics.py ${EVAL_DIR}/gdpo/<RUN>/checkpoint-1000/fps5_tti/<TESTSET>
+```
+
+> 배치 런처(`run_*.sh`)는 원래 이 서버 전용이라 `PY`(conda python), `WAIT_PID`(선행 작업)
+> 같은 값이 박혀 있었다. 지금은 환경변수로 덮어쓸 수 있게 바꿨지만, 다른 서버에서는
+> `PY` / `WAIT_PID` / `RUN` / `CK` 를 상황에 맞게 확인하고 쓸 것.
 
 ---
 
