@@ -482,11 +482,17 @@ def train(attn_implementation="flash_attention_2"):
                         output_text = "[debug_interleave: generate skipped]"
                     else:
                         with torch.no_grad():
+                            # repetition_penalty 를 명시하지 않으면 generation_config.json 의
+                            # 1.05 가 greedy 에서도 적용된다. 타임토큰 출력은 같은 숫자 토큰을
+                            # 반복 사용하므로 페널티가 값 자체를 왜곡하고, 종료(.+EOS)도 억제해
+                            # 세그먼트를 과분할한다(학습 pred/샘플 1.36 → 평가 2.10).
+                            # 학습측(rollout·val)은 둘 다 1.0 을 명시한다 — 동일하게 맞춘다.
                             outputs = model.generate(
                                 **inputs,
                                 max_new_tokens=1024,
                                 do_sample=data_args.do_sample,
-                                top_p=0.9)
+                                top_p=0.9,
+                                repetition_penalty=1.0)
                         output_trimmed = outputs[0, len(inputs["input_ids"][0]):]
                         output_text = tokenizer.decode(output_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
                         if os.environ.get("TT_DEBUG", "0") == "1":
