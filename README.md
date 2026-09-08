@@ -78,6 +78,55 @@ python tools/sft/verify_time_tokens.py          # 등록 확인
 
 ---
 
+## 📦 아카이브 & 복원
+
+서버 정리(2026-09-08)로 대용량 산출물은 전부 Google Drive 로 옮겼다. 레포에는 **코드만**
+남아 있으므로, 재현하려면 아래 세 디렉터리를 먼저 내려받아야 한다.
+
+| 원래 로컬 경로 | gdrive 원격 | 크기 | 내용 |
+|---|---|---|---|
+| `workspace/checkpoints` | `gdrive:checkpoints` | 59 GB  | base(time-token 추가본), SFT/GDPO LoRA 및 머지 체크포인트 |
+| `workspace/data`        | `gdrive:data`        | 407 MB | 학습/평가 JSON (`train/`, `val/`, `test/<TESTSET>/chunk_*.json`) |
+| `workspace/outputs`     | `gdrive:outputs`     | 78 GB  | 추론 결과(`test_results_rank*.json`) + eval summary + `table.txt` |
+
+### 전체 복원
+
+```bash
+WS=$HOME/workspace     # = DATA_ROOT / BASE_ROOT 가 가리키는 곳
+
+rclone copy gdrive:data        $WS/data        --transfers 8 --checkers 16 --progress
+rclone copy gdrive:checkpoints $WS/checkpoints --transfers 8 --checkers 16 --drive-chunk-size 32M --progress
+rclone copy gdrive:outputs     $WS/outputs     --transfers 8 --checkers 16 --drive-chunk-size 32M --progress
+```
+
+> `--transfers` × `--drive-chunk-size` 가 곧 rclone 의 메모리 사용량이다. RAM 이 작은 서버면
+> `--transfers 4 --drive-chunk-size 16M` 으로 낮출 것. (이관 당시 서버: RAM 3 GB / 2 vCPU)
+
+### 부분 복원 (권장)
+
+표를 다시 뽑거나 수치만 확인할 목적이면 `outputs` 전체를 받을 필요가 없다.
+런 하나는 보통 수백 MB ~ 수 GB 다.
+
+```bash
+rclone lsd  gdrive:outputs/gdpo                                    # 런 목록 확인
+rclone copy gdrive:outputs/gdpo/<RUN_ID> $WS/outputs/gdpo/<RUN_ID> --progress
+python eval/maketable.py $WS/outputs/gdpo                          # 받은 것만으로 표 생성
+```
+
+체크포인트도 마찬가지로 필요한 스텝만:
+
+```bash
+rclone copy gdrive:checkpoints/gdpo/<RUN_ID>/checkpoint-1000 \
+            $WS/checkpoints/gdpo/<RUN_ID>/checkpoint-1000 --progress
+```
+
+### 복원 후
+
+`paths.env` 의 `BASE_ROOT` / `DATA_ROOT` 를 새 서버 경로로 맞추면 나머지 경로는 자동 파생되고
+파이프라인이 그대로 돈다 (`paths.env` 는 gitignore 대상 — `paths.example.env` 에서 복사).
+
+---
+
 ## 🚀 재현 파이프라인
 
 ### Stage 1 — SFT
@@ -140,11 +189,31 @@ bash eval.sh CKPT_STEP=base TEST_JSON=${TEST_DIR}/unav100_v2_500.json
 # 이미 추론된 결과 재평가 (GPU 불필요)
 bash eval.sh MODE=eval RESULTS=<out_dir>/test_results_rank0.json TEST_JSON=<GT>.json
 
-# 결과 표 생성
-python maketable.py
+# 결과 표 생성 (해당 폴더 하위의 모든 summary → table.txt)
+python maketable.py ${EVAL_DIR}/gdpo
+python maketable.py ${EVAL_DIR}/gdpo --full   # 구버전 21열 (F1@0.9, SCR, R@θ, gt/pred 평균)
 ```
 
 결과: `${EVAL_DIR}/<branch>/fps<N>_<format>/<TESTSET_TAG>/eval_miou_summary.json`
+
+#### 보고 지표
+
+`maketable.py` 기본 표(12열). 보고할 때는 아래 **세 계열을 항상 같이** 싣는다 —
+mIoU 만으로는 세그먼트를 몇 개 잡았는지가 안 보이고, F1 만으로는 위치 품질이 안 보인다.
+
+| 열 | 의미 |
+|---|---|
+| `sample_mIoU` | 샘플 단위 All_IoU 평균 (`sample_miou_summary.json`) |
+| `F1@0.1/0.3/0.5/0.7` | pairwise(best-match 세그먼트) 기준 F1 (`pairwise_miou_summary.json`) |
+| `CountF1` | `USA`·`OSA` 의 조화평균. 하나라도 0 이면 0 |
+| `USA` (= CR*) | N_gt≥2 에서 chance 보정 개수일치도. under-segmentation 해소력 |
+| `OSA` (= 1−FMR) | N_gt=1 을 쪼개지 않은 비율. over-segmentation 억제력 |
+
+> ⚠️ `sample_mIoU` 는 **sample 단위**, `F1@θ` 는 **pairwise 단위**로 계열이 다르다.
+> 열 이름에서 `sample` 을 떼고 그냥 `mIoU` 로 적지 말 것.
+>
+> ⚠️ 파싱 실패(pred 0개)가 많은 모델은 `N_pred≤1` 로 잡혀 `OSA` 가 부풀 수 있다.
+> 비교 전 summary 의 `parse_fail` 을 반드시 같이 확인할 것.
 
 ---
 
@@ -188,6 +257,16 @@ bash tools/debug/smoke_dump_all_modes.sh        # 모드별 샘플 dump
 bash tools/debug/sweep_dump.sh                  # BASE_INTERVAL × VIDEO_MAX_FRAMES sweep
 python tools/debug/compare.py --in_dir _debug_out/... --format csv
 ```
+
+### 알려진 함정 — `repetition_penalty`
+
+`generation_config.json` 의 `repetition_penalty=1.05` 는 **명시하지 않으면 greedy 에서도
+적용된다**. 타임토큰 출력은 같은 숫자 토큰을 반복 사용하므로 페널티가 예측 시각 값 자체를
+왜곡하고, 종료(`.`+EOS)까지 억제해 세그먼트를 과분할한다 (학습 pred/샘플 1.36 → 평가 2.10).
+
+학습측(rollout·val)과 `train_qwen.py` 의 debug_interleave generate 는 모두
+`repetition_penalty=1.0` 을 **명시**한다. 새 `generate()` 호출을 추가할 때도 반드시 같이 넣을 것 —
+안 넣으면 학습/평가 지표가 조용히 어긋난다.
 
 ## 📄 License
 
