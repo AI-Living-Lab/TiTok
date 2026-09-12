@@ -398,6 +398,7 @@ def compute_shared_block(samples):
         },
         "parse_ok": parse_ok,
         "parse_fail": parse_fail,
+        "parse_fail_rate_%": round(100.0 * parse_fail / max(n, 1), 4),
     }
 
 
@@ -565,7 +566,8 @@ def write_and_report(results_file, summaries, args):
               f"unmatched={s0.get('gt_unmatched')})  natural={s0.get('natural')}")
         print(f"  Samples: {s0['n_samples']}  GT segs: {s0['gt_segments']['total']}  "
               f"Pred segs: {s0['pred_segments']['total']}  "
-              f"parse_ok/fail: {s0['parse_ok']}/{s0['parse_fail']}")
+              f"parse_ok/fail: {s0['parse_ok']}/{s0['parse_fail']}  "
+              f"parse-fail rate: {s0['parse_fail_rate_%']:.2f}%")
         print(f"  {'method':9s} | mIoU%  | R@.1/.3/.5/.7  | F1_avg | FP/FN_avg%")
         for m in METHODS:
             s = summaries[m]

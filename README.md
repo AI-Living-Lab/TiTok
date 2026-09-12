@@ -32,12 +32,24 @@ Team4/
 ├── eval/                       # Stage 3: 추론 + mIoU 평가
 ├── tools/                      # 보조: TTI 회귀검증, debug dump, time-token 추가, 데이터 준비
 ├── docs/                       # 상세 가이드 (GDPO 학습법 / 평가법 / 결과 기록)
+├── tools/data_manifests/       # Charades-STA 재현용 파일 목록 (아래 "데이터" 참고)
+├── setup.sh                    # RunPod 서버 환경 부트스트랩 (rclone/conda/WandB env)
 └── paths.example.env           # 경로 템플릿
 ```
 
 ---
 
 ## 🔧 셋업
+
+### 0) 서버 부트스트랩 (RunPod)
+
+새 RunPod 인스턴스에서 시작할 때:
+
+```bash
+source setup.sh   # rclone(/workspace/home) + miniconda PATH + WandB env 설정
+```
+
+> ⚠️ `setup.sh` 의 `WANDB_API_KEY` 는 플레이스홀더. 실제 키로 교체해 쓰되 **커밋 금지**.
 
 ### 1) 환경 변수
 
@@ -75,6 +87,14 @@ python tools/sft/verify_time_tokens.py          # 등록 확인
 | `${TEST_DIR}/{TESTSET}/chunk_*.json` | Stage 3 평가 (chunk 단위) |
 
 > chunk 분할: `python eval/_chunk_helpers.py split --test_json <원본> --chunks_dir data/test/<NAME>/`
+
+`tools/data_manifests/`: Charades-STA 원본 영상 세트를 다시 받을 때 필요한 파일 목록 3종.
+
+| 파일 | 용도 |
+|---|---|
+| `charades_sta_needed_files.txt` | Charades-STA 평가에 실제로 쓰이는 mp4 목록 (`Charades_v1/<id>.mp4`) — 전체 데이터셋 대신 이 목록만 받으면 됨 |
+| `charades_sta_include.txt` | 위 목록의 glob 패턴 버전 (`**/<id>.mp4`) — 다운로드 스크립트 필터용 |
+| `charades_sta_test.txt` | Charades-STA 평가 GT 원본(`구간 시작 끝##caption`) |
 
 ---
 
@@ -146,6 +166,8 @@ python maketable.py
 
 결과: `${EVAL_DIR}/<branch>/fps<N>_<format>/<TESTSET_TAG>/eval_miou_summary.json`
 
+과거 결과 스냅샷(참고용, 재현 시 `maketable.py` 로 재생성 권장): [docs/results_snapshot_2026-08-30.txt](docs/results_snapshot_2026-08-30.txt)
+
 ---
 
 ## 🎯 Time-Token Interleaving (TTI)
@@ -187,6 +209,27 @@ bash tools/tti/run_all.sh ${CKPT_DIR}/base/video_salmonn2_plus_7B_time_tokens
 bash tools/debug/smoke_dump_all_modes.sh        # 모드별 샘플 dump
 bash tools/debug/sweep_dump.sh                  # BASE_INTERVAL × VIDEO_MAX_FRAMES sweep
 python tools/debug/compare.py --in_dir _debug_out/... --format csv
+```
+
+## ☁️ 백업 (Google Drive)
+
+서버(구 RunPod team404 인스턴스) 정리 시점(2026-09-12)에 아래 3개 디렉토리를
+Google Drive(`ewhaailab2026@gmail.com`)로 백업함. `.merged_model/`(머지된 풀 체크포인트,
+용량이 커서 재현 시 Stage 1.5 로 재생성 가능)은 `outputs` 백업에서 제외.
+
+| 로컬 (RunPod) | Google Drive |
+|---|---|
+| `${CKPT_DIR}` (`/workspace/checkpoints`) | `gdrive:checkpoints` |
+| `${TRAIN_DIR}`/`${TEST_DIR}` 상위 (`/workspace/data`) | `gdrive:data` |
+| `${EVAL_DIR}` (`/workspace/outputs`, `.merged_model/` 제외) | `gdrive:outputs` |
+
+새 서버에서 복원:
+
+```bash
+source setup.sh   # rclone 바이너리 + gdrive remote(rclone.conf) 준비
+rclone copy gdrive:checkpoints ${CKPT_DIR} --transfers 8 --checkers 8
+rclone copy gdrive:data        /workspace/data --transfers 8 --checkers 8
+rclone copy gdrive:outputs     ${EVAL_DIR} --transfers 8 --checkers 8
 ```
 
 ## 📄 License
